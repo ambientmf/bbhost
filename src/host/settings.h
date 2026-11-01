@@ -33,6 +33,7 @@ struct HostSettings {
     bool fps_counter = false;
     bool memory_counter = false;  // video memory and shared GPU memory, under the FPS counter (host/window.cpp)
     bool perf_overlay = false;    // the bottleneck meter's verdict under them (host/window.cpp, host/perf_meter.h)
+    bool ping_counter = false;    // each connected player's round trip, under them (host/window.cpp, hle/net_p2p.h)
     int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
 
     // Camera: multipliers on LockCamParam's values (engine/camera.cpp)

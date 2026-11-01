@@ -29,6 +29,16 @@ namespace net {
 
 namespace {
 
+// BBHOST_NET_TRACE=1 (hle/net.cpp's every-datagram trace): the server's
+// answers in full too.
+bool net_trace() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_NET_TRACE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 using clock = std::chrono::steady_clock;
 
 // ---- the dispatcher -------------------------------------------------------
@@ -534,6 +544,9 @@ bool server_signaling_resolve(const std::string& id, std::uint32_t* addr, std::u
     body.set("OnlineId", id);
     json::Value reply;
     if (!np_post("/np/signaling/resolve", body, reply, error)) return false;
+    // BBHOST_NET_TRACE=1: the server's whole answer, the fields this
+    // function does not read included.
+    if (net_trace()) host_log("net: resolve %s -> %s", id.c_str(), json::dump(reply, 0).c_str());
     if (int_of(reply, "ResKind", -1) != 0) {
         error = "not registered";
         return false;
@@ -678,6 +691,31 @@ void server_signaling_update() {
     np_post("/mp/matching2/signaling_update", body, reply, err, 4000);
 }
 
+// What the server tells other players about us - our own online id
+// resolved, as a peer's sceNpSignalingActivateConnection would - against our
+// STUN address. A peer probes the address the server gives it, so when the
+// two differ nobody can reach us; logged only then. Checked when the
+// keepalive starts and after each address change it sends.
+void self_resolve_check() {
+    std::string mapped;
+    {
+        std::lock_guard<std::mutex> lk(g_mapped.mu);
+        if (g_mapped.addr.empty() || !g_mapped.port) return;
+        mapped = g_mapped.addr + ":" + std::to_string(g_mapped.port);
+    }
+    json::Value body = json::Value::make_object();
+    body.set("OnlineId", online_id());
+    json::Value reply;
+    std::string err;
+    if (!np_post("/np/signaling/resolve", body, reply, err, 4000) || int_of(reply, "ResKind", -1) != 0) return;
+    const std::string told = str_of(reply, "Addr") + ":" + std::to_string(int_of(reply, "Port", 0));
+    if (told != mapped) {
+        host_log("net: the server tells other players we are at %s, but our STUN address is %s: their connections to "
+                 "us go to the wrong place",
+                 told.c_str(), mapped.c_str());
+    }
+}
+
 // While the context runs: the STUN binding every 15 s. It keeps our NAT
 // mapping to the server open (a router forgets an idle UDP mapping in 30 s
 // to a few minutes, and then nothing the relay sends gets in) and the
@@ -692,6 +730,7 @@ void keepalive_main(std::uint64_t gen) {
         std::lock_guard<std::mutex> lk(g_mapped.mu);
         last = g_mapped.addr + ":" + std::to_string(g_mapped.port);
     }
+    self_resolve_check();
     for (;;) {
         if (!g_gate.sleep(gen, 15000)) break;
         mapped_refresh(true);
@@ -703,6 +742,7 @@ void keepalive_main(std::uint64_t gen) {
         if (now != last && now != ":0") {
             host_log("stun: our address is now %s (was %s); telling the server", now.c_str(), last.c_str());
             server_signaling_update();
+            self_resolve_check();
             last = now;
         }
     }

@@ -15,6 +15,10 @@ std::string hle_np_online_status();
 // True once the game has started its Matching2 context (it read its NpId before that,
 // so an account logged in afterwards only takes effect on the next launch).
 bool hle_np_context_started();
+// True while the game is in a Matching2 room - a world shared with summoned
+// players or invaders - as host or as guest. The peer table's members below
+// 0xff00 are then the room's other players (the ping counter's list).
+bool hle_np_in_room();
 void hle_register_np_signaling();
 
 // NpSignaling learns a peer's address: fires ESTABLISHED/ACTIVE for a

@@ -611,6 +611,10 @@ if(UNIX)
   add_test(NAME net_p2p_small_test COMMAND net_p2p_test)
   set_tests_properties(net_p2p_small_test PROPERTIES ENVIRONMENT BBHOST_NET_LARGE_DATAGRAMS=0)
   set_tests_properties(net_p2p_test net_p2p_whole_test net_p2p_small_test PROPERTIES TIMEOUT 60)
+  # The ping counter's datagrams and arithmetic (net/ping_wire.h).
+  add_executable(ping_test tests/ping_test.cpp)
+  target_include_directories(ping_test PRIVATE src)
+  add_test(NAME ping_test COMMAND ping_test)
   # The event poller's long polls and generations (net/poll_pacing.h).
   add_executable(poll_pacing_test tests/poll_pacing_test.cpp)
   target_include_directories(poll_pacing_test PRIVATE src)

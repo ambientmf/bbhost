@@ -229,6 +229,11 @@ bool hle_np_context_started() {
     return g.started;
 }
 
+bool hle_np_in_room() {
+    std::lock_guard<std::mutex> lk(g.mu);
+    return g.in_room;
+}
+
 std::string hle_np_online_status() {
     std::string s = "Signed in as " + net::online_id();
     if (net::account_logged_in()) s += " (account)";

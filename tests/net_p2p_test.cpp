@@ -8,6 +8,8 @@
 // whole with BBHOST_NET_SPLIT_DATAGRAMS=0. With BBHOST_NET_LARGE_DATAGRAMS=0,
 // the 2 KB limit of before.
 #include "guest_abi.h"
+#include "host/settings.h"
+#include "net/session.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -85,12 +87,20 @@ int free_udp_port() {
 }
 }  // namespace
 
-// What hle/net.cpp needs from the rest of the host: the HLE table and the
-// session layer's P2P port.
+// What hle/net.cpp needs from the rest of the host: the HLE table, the
+// session layer's P2P port, and what the ping counter's pinger reads (the
+// counter is off here, so it pings no one).
 void register_hle_fn(const char* name, void* f) { g_fns[name] = f; }
+const HostSettings& host_settings_ref() {
+    static const HostSettings settings;
+    return settings;
+}
+bool hle_np_in_room() { return false; }
 namespace net {
 int p2p_port() { return g_port; }
 void set_p2p_port_bound(int port) { g_port = port; }
+std::string online_id() { return "test"; }
+std::vector<Peer> peers_all() { return {}; }
 }  // namespace net
 
 int main() {

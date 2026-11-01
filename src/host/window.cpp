@@ -9,6 +9,7 @@
 #include "engine/mouse_camera_step.h"
 #include "engine/option_menu.h"
 #include "hle/modules.h"
+#include "hle/net_p2p.h"
 #include "host/bindings.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -2317,6 +2318,80 @@ bool host_window_pump() {
             corner_y += 24.0f * scale + 8.0f;
         }
         corner_y += 8.0f;
+    }
+    if (host_settings_ref().ping_counter) {
+        // The ping counter, below the others: each other player in this
+        // world (the Matching2 room) and the round trip of the last ping to them
+        // (hle/net_p2p.h; pinged every 5 s, read here twice a second). The
+        // names left-aligned, the times right-aligned, in one box, in the
+        // other counters' colour; only a time is coloured: green below 100 ms,
+        // yellow to 199, red from 200.
+        // A player whose bbhost does not answer pings gets the round trip
+        // read from the game's own acknowledgements, as `~N ms`.
+        static std::vector<P2pPing> pings;
+        static std::uint64_t read_at = 0;
+        const std::uint64_t now = host_clock_monotonic_ns();
+        if (!read_at || now - read_at >= 500'000'000ull) {
+            read_at = now;
+            pings = hle_net_p2p_pings();
+        }
+        float dw = 0.0f;
+        {
+            std::lock_guard<std::mutex> ml(g_mouse_mu);
+            dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
+        }
+        const float scale = 0.8f, row_h = 24.0f * scale + 8.0f, gap = 24.0f;
+        struct Row {
+            std::string name;
+            char value[24];
+            std::uint32_t rgba;
+        };
+        std::vector<Row> rows;
+        for (const P2pPing& p : pings) {
+            Row r;
+            r.name = p.online_id.size() > 16 ? p.online_id.substr(0, 16) : p.online_id;
+            // Our pings' round trip when the peer answers them; else the
+            // one read from the game's own acknowledgements, marked `~`;
+            // else timeout (it answered and stopped) or -- (nothing yet).
+            const auto colour = [](int ms) { return ms < 100 ? 0x8fe08fffu : ms < 200 ? 0xe6d36bffu : 0xe67a6bffu; };
+            if (p.last_ms >= 0 && !p.lost) {
+                std::snprintf(r.value, sizeof(r.value), "%d ms", p.last_ms);
+                r.rgba = colour(p.last_ms);
+            } else if (p.game_ms >= 0) {
+                std::snprintf(r.value, sizeof(r.value), "~%d ms", p.game_ms);
+                r.rgba = colour(p.game_ms);
+            } else if (p.lost && p.last_ms >= 0) {
+                std::snprintf(r.value, sizeof(r.value), "timeout");
+                r.rgba = 0xe67a6bffu;
+            } else {
+                std::snprintf(r.value, sizeof(r.value), "--");
+                r.rgba = 0xe6e6e6ffu;
+            }
+            rows.push_back(std::move(r));
+        }
+        if (rows.empty()) {
+            // Alone in the world - most of the time: as short as it can say it.
+            const char* text = "Ping: no players";
+            const float w = host_overlay_text_width(scale, text);
+            const float x = dw - w - 20.0f;
+            host_overlay_rect(x - 8.0f, corner_y - 4.0f, w + 16.0f, row_h, 0x000000a0u);
+            host_overlay_text(x, corner_y, scale, 0xe6e6e6ffu, text);
+            corner_y += 24.0f * scale + 16.0f;
+        } else {
+            float name_w = 0.0f, value_w = host_overlay_text_width(scale, "timeout");
+            for (const Row& r : rows) {
+                name_w = std::max(name_w, host_overlay_text_width(scale, r.name.c_str()));
+                value_w = std::max(value_w, host_overlay_text_width(scale, r.value));
+            }
+            const float w = name_w + gap + value_w, x = dw - w - 20.0f;
+            host_overlay_rect(x - 8.0f, corner_y - 4.0f, w + 16.0f, row_h * static_cast<float>(rows.size()), 0x000000a0u);
+            for (const Row& r : rows) {
+                host_overlay_text(x, corner_y, scale, 0xe6e6e6ffu, r.name.c_str());
+                host_overlay_text(x + w - host_overlay_text_width(scale, r.value), corner_y, scale, r.rgba, r.value);
+                corner_y += row_h;
+            }
+            corner_y += 8.0f;
+        }
     }
     {
         // A plugin's banner (host_message_show): centred in the upper third,

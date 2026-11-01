@@ -3,6 +3,9 @@
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "hle/net_p2p.h"
+#include "hle/np.h"
+#include "host/settings.h"
+#include "net/ping_wire.h"
 #include "net/session.h"
 #include "net/stun.h"
 
@@ -20,6 +23,7 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -38,6 +42,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -329,9 +334,60 @@ struct P2pPort {
     // When a datagram last arrived from each source (addr | port << 32, both
     // network order): the hole-punch stops once the peer is heard.
     std::map<std::uint64_t, std::chrono::steady_clock::time_point> heard;
+    // BBHOST_NET_TRACE=1: the sources a datagram came from, each logged
+    // once ("net: first datagram"), up to kDiagSources.
+    std::set<std::uint64_t> diag_seen;
 };
+constexpr std::size_t kDiagSources = 1024;
 // A hole-punch probe: not a P2P datagram (no 0xff), dropped by the reader.
 constexpr std::uint8_t kProbe[8] = {0xfe, 'b', 'b', 'h', 'p', 0, 0, 0};
+
+// The ping counter (hle_net_p2p_pings): its wire format, its arithmetic and
+// why other clients never see a ping are in net/ping_wire.h.
+namespace ping = net::ping;
+
+std::int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// One connected peer the pinger follows, by online id.
+struct PingPeer {
+    std::uint32_t addr = 0;  // network order: where the game sends to (the peer table's addr:port)
+    std::uint16_t port = 0;  // network order
+    std::uint32_t seq = 0;   // the last ping's
+    std::uint32_t answered_seq = 0;
+    std::int64_t first_ping_ns = 0, last_pong_ns = 0;
+    std::int64_t reported_ns = 0;  // its last summary, or when it was first seen
+    int last_ms = -1;
+    int min_ms = -1, max_ms = -1;
+    double avg_ms = -1.0;  // smoothed, 1/4 a sample
+    std::uint32_t sent = 0, answered = 0;
+    std::uint32_t sent_reported = 0, answered_reported = 0;
+    bool silence_logged = false;
+    // The game's own round trip (game_ack_*): the lowest over the last
+    // ping::kAckWindowNs, as of the pinger's last pass; -1: no sample in it.
+    int game_ms = -1;
+    std::uint32_t game_samples = 0, game_samples_reported = 0;
+    int game_min_ms = -1;  // since the last summary
+    bool game_logged = false;
+};
+
+struct PingTable {
+    std::mutex mu;
+    std::map<std::string, PingPeer> peers;
+    // By (addr | port << 32, both network order; our vport).
+    std::map<std::pair<std::uint64_t, std::uint16_t>, ping::AckChannel> game_acks;
+    ping::PongLimiter pongs;
+};
+PingTable& g_ping = *new PingTable;  // never destroyed: the pinger is a detached thread
+std::atomic<bool> g_pinger_started{false};
+// Whether the game's datagrams are read for their acknowledgements
+// (game_ack_*), as of the pinger's last pass: only while the counter is on and
+// some player in the room is not answering pings - never outside a room, and
+// never when every peer answers, so the game's own send and receive paths pay
+// one atomic load the rest of the time.
+std::atomic<bool> g_game_acks_on{false};
 
 // The private server's relay (net/stun.h): once a STUN answer carried
 // BBHOST-RELAY, a datagram for another relay port (the server's address, not
@@ -370,6 +426,86 @@ bool from_relay_server(const sockaddr_in& sa) {
 }
 inline std::uint64_t source_key(std::uint32_t addr, std::uint16_t port_nbo) {
     return addr | (static_cast<std::uint64_t>(port_nbo) << 32);
+}
+
+// Sends a datagram from the P2P port to `to` as the game's own go: framed for
+// the relay when `to` is a relay port. Returns the bytes of `pkt` sent (the
+// frame's header not counted), or the send's negative result.
+ssize_type p2p_sendto(sockfd_t fd, const std::uint8_t* pkt, std::size_t len, bool dontwait, const sockaddr_in& to) {
+    std::uint8_t token[net::stun::kTokenLen];
+    sockaddr_in stun_sa{};
+    if (relay_target(to.sin_addr.s_addr, to.sin_port, token, &stun_sa)) {
+        std::uint8_t frame[2048 + kRelayHeader];
+        if (len > sizeof(frame) - kRelayHeader) return -1;
+        frame[0] = kRelayMagic;
+        frame[1] = kRelayToServer;
+        std::memcpy(frame + 2, token, net::stun::kTokenLen);
+        std::memcpy(frame + 10, &to.sin_port, 2);  // network order is the frame's big-endian
+        std::memcpy(frame + kRelayHeader, pkt, len);
+        ssize_type n = sock_sendto(fd, frame, kRelayHeader + len, dontwait, &stun_sa);
+        if (n >= 0) n -= static_cast<ssize_type>(kRelayHeader);
+        return n;
+    }
+    return sock_sendto(fd, pkt, len, dontwait, &to);
+}
+
+// A game datagram leaving for (or arriving from) addr:port on our `vport`,
+// its payload after the vport header: the round trip's two ends.
+void game_ack_sent(std::uint32_t addr, std::uint16_t port_nbo, std::uint16_t vport, const std::uint8_t* d, std::size_t n) {
+    if (!g_game_acks_on.load(std::memory_order_relaxed)) return;
+    ping::GameMsg m[ping::kMaxMsgs];
+    const int k = ping::game_msgs(d, n, m, ping::kMaxMsgs);
+    if (!k) return;
+    const std::int64_t now = steady_ns();
+    std::lock_guard<std::mutex> lk(g_ping.mu);
+    g_ping.game_acks[{source_key(addr, port_nbo), vport}].on_sent(m, k, now);
+}
+void game_ack_received(std::uint32_t addr, std::uint16_t port_nbo, std::uint16_t vport, const std::uint8_t* d,
+                       std::size_t n) {
+    if (!g_game_acks_on.load(std::memory_order_relaxed)) return;
+    ping::GameMsg m[ping::kMaxMsgs];
+    const int k = ping::game_msgs(d, n, m, ping::kMaxMsgs);
+    if (!k) return;
+    const std::int64_t now = steady_ns();
+    std::lock_guard<std::mutex> lk(g_ping.mu);
+    auto it = g_ping.game_acks.find({source_key(addr, port_nbo), vport});
+    if (it != g_ping.game_acks.end()) it->second.on_received(m, k, now);
+}
+
+// The reader, on a ping or a pong from `from` (after the relay's framing came
+// off, so a relayed peer is server:vport, as the game and the peer table know
+// it). Called without the port's lock.
+void ping_datagram(sockfd_t fd, const std::uint8_t* buf, std::size_t n, const sockaddr_in& from) {
+    ping::Packet pk;
+    if (!ping::parse(buf, n, &pk)) return;
+    const std::int64_t now = steady_ns();
+    if (pk.kind == ping::kPing) {
+        {
+            std::lock_guard<std::mutex> lk(g_ping.mu);
+            if (!g_ping.pongs.allow(now)) return;
+        }
+        std::uint8_t pong[ping::kLen];
+        ping::build(pong, ping::kPong, pk.seq, pk.t_ns);
+        (void)p2p_sendto(fd, pong, sizeof(pong), true, from);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_ping.mu);
+    for (auto& [id, p] : g_ping.peers) {
+        if (p.addr != from.sin_addr.s_addr || p.port != from.sin_port) continue;
+        const int ms = ping::pong_ms(pk, p.answered_seq, p.seq, now);
+        if (ms < 0) return;
+        const bool first = p.answered == 0;
+        p.answered_seq = pk.seq;
+        p.last_pong_ns = now;
+        p.last_ms = ms;
+        p.min_ms = p.min_ms < 0 ? ms : std::min(p.min_ms, ms);
+        p.max_ms = std::max(p.max_ms, ms);
+        p.avg_ms = p.avg_ms < 0 ? ms : p.avg_ms * 0.75 + ms * 0.25;
+        ++p.answered;
+        p.silence_logged = false;
+        if (first) host_log("net: ping %s: %d ms (the peer answers pings)", id.c_str(), ms);
+        return;
+    }
 }
 
 // One line per port every 60 s (and at close): the stream's shape.
@@ -438,6 +574,41 @@ bool g_net_trace = [] {
     return e && e[0] == '1';
 }();
 constexpr int kTraceFirst = 400;
+
+// BBHOST_NET_TRACE=1: the game's datagrams to and from each peer address, by
+// our vport, logged and reset every 15 s by the pinger ("net: traffic").
+struct DiagTraffic {
+    std::mutex mu;
+    struct Counts {
+        std::uint32_t in = 0, out = 0;
+    };
+    std::map<std::pair<std::uint64_t, std::uint16_t>, Counts> by_peer;  // (source_key, our vport)
+};
+DiagTraffic& g_diag_traffic = *new DiagTraffic;
+void diag_traffic(bool out, std::uint32_t addr, std::uint16_t port_nbo, std::uint16_t our_vport) {
+    if (!g_net_trace) return;
+    std::lock_guard<std::mutex> lk(g_diag_traffic.mu);
+    auto& c = g_diag_traffic.by_peer[{source_key(addr, port_nbo), our_vport}];
+    ++(out ? c.out : c.in);
+}
+void diag_traffic_report() {
+    std::map<std::pair<std::uint64_t, std::uint16_t>, DiagTraffic::Counts> snap;
+    {
+        std::lock_guard<std::mutex> lk(g_diag_traffic.mu);
+        snap.swap(g_diag_traffic.by_peer);
+    }
+    if (snap.empty()) return;
+    std::string line;
+    for (const auto& [k, c] : snap) {
+        char ip[32];
+        write_ipv4(ip, sizeof(ip), static_cast<std::uint32_t>(k.first));
+        line += std::string(line.empty() ? "" : "; ") + ip + ":" +
+                std::to_string(bswap16(static_cast<std::uint16_t>(k.first >> 32))) + " vport " + std::to_string(k.second) +
+                " in " + std::to_string(c.in) + " out " + std::to_string(c.out);
+    }
+    host_log("net: traffic 15 s: %s", line.c_str());
+}
+
 bool trace_now(int& count) {
     if (g_net_trace) return true;
     return ++count <= kTraceFirst;
@@ -501,6 +672,28 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
         }
         std::uint16_t src = 0, dst = 0;
         const std::size_t hdr = p2p_header(buf, static_cast<std::size_t>(n), &src, &dst);
+        {
+            // BBHOST_NET_TRACE=1: the first datagram from each source,
+            // whatever it is - a peer whose probes come from a port other
+            // than the one the server gave shows up here.
+            bool fresh = false;
+            if (g_net_trace) {
+                std::lock_guard<std::mutex> lk(port->mu);
+                if (port->diag_seen.size() < kDiagSources) {
+                    fresh = port->diag_seen.insert(source_key(sa.sin_addr.s_addr, sa.sin_port)).second;
+                }
+            }
+            if (fresh) {
+                char ip[32];
+                write_ipv4(ip, sizeof(ip), sa.sin_addr.s_addr);
+                const char* what = hdr ? "game"
+                                   : (n >= 8 && std::memcmp(buf, kProbe, 5) == 0) ? "probe"
+                                   : (n >= 20 && buf[0] == 0x01 && buf[1] == 0x01) ? "stun"
+                                                                                   : "unknown";
+                host_log("net: first datagram from %s:%u: %s, %d bytes%s", ip, bswap16(sa.sin_port), what,
+                         static_cast<int>(n), hdr ? (" vport " + std::to_string(src) + "->" + std::to_string(dst)).c_str() : "");
+            }
+        }
         std::shared_ptr<SockQueue> q;
         bool forwarded = false;
         if (!hdr) {
@@ -508,10 +701,15 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
             // server's answer to our Binding Request. Neither reaches a
             // game socket.
             if (n >= 8 && std::memcmp(buf, kProbe, 5) == 0) {
-                std::lock_guard<std::mutex> lk(port->mu);
-                ++port->rx;
-                ++port->probes;
-                port->heard[source_key(sa.sin_addr.s_addr, sa.sin_port)] = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lk(port->mu);
+                    ++port->rx;
+                    ++port->probes;
+                    port->heard[source_key(sa.sin_addr.s_addr, sa.sin_port)] = std::chrono::steady_clock::now();
+                }
+                if (buf[5] == ping::kPing || buf[5] == ping::kPong) {
+                    ping_datagram(port->fd, buf, static_cast<std::size_t>(n), sa);
+                }
                 continue;
             }
             if (n >= 20 && buf[0] == 0x01 && buf[1] == 0x01) {
@@ -558,6 +756,10 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
         dg.addr = sa.sin_addr.s_addr;
         dg.port = sa.sin_port;
         dg.vport = src;
+        if (hdr) {
+            diag_traffic(false, sa.sin_addr.s_addr, sa.sin_port, dst);
+            game_ack_received(sa.sin_addr.s_addr, sa.sin_port, dst, dg.data.data(), dg.data.size());
+        }
         if (trace_now(logs)) {
             char ip[32];
             write_ipv4(ip, sizeof(ip), sa.sin_addr.s_addr);
@@ -683,6 +885,7 @@ std::shared_ptr<P2pPort> p2p_port_open(std::uint16_t want) {
     }
     port->reader = std::thread(p2p_reader, port);
     g_p2p_ports[port->port] = port;
+    hle_net_p2p_pinger_start();
     return port;
 }
 
@@ -1000,6 +1203,11 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
         if (n < 0) break;
         ++sent;
         if (total > kOneFramePayload) ++big;
+    }
+    if (sock.p2p && sent == ends.size()) {
+        diag_traffic(true, to->addr, to->port, sock.vport);
+        // The pieces are whole chunks, so the whole holds the messages the peer gets.
+        game_ack_sent(to->addr, to->port, sock.vport, bytes, static_cast<std::size_t>(len));
     }
     static int logs = 0;
     if (trace_now(logs)) {
@@ -1596,7 +1804,213 @@ void hle_net_p2p_punch(const char* label, std::uint32_t addr, std::uint16_t port
         char ip[32];
         write_ipv4(ip, sizeof(ip), targets[0].sin_addr.s_addr);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-        host_log("net: punch %s %s:%u%s: %d probes, %s after %lld ms", name.c_str(), ip, bswap16(targets[0].sin_port),
-                 targets.size() > 1 ? " (+local)" : "", sent, heard ? "peer heard" : "nothing heard", static_cast<long long>(ms));
+        // Unheard: did anything ever come from the peer's address, on any
+        // port (its NAT gave it one the server does not know), and how long
+        // ago - or nothing at all, which says the peer never sent.
+        std::string from;
+        if (!heard) {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(port->mu);
+            for (const auto& [key, at] : port->heard) {
+                if (static_cast<std::uint32_t>(key) != targets[0].sin_addr.s_addr) continue;
+                from += std::string(from.empty() ? "" : ",") + " :" +
+                        std::to_string(bswap16(static_cast<std::uint16_t>(key >> 32))) + " " +
+                        std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now - at).count()) + " s ago";
+            }
+            from = "; from that address:" + (from.empty() ? std::string(" nothing, ever") : from);
+        }
+        host_log("net: punch %s %s:%u%s: %d probes, %s after %lld ms%s", name.c_str(), ip, bswap16(targets[0].sin_port),
+                 targets.size() > 1 ? " (+local)" : "", sent, heard ? "peer heard" : "nothing heard", static_cast<long long>(ms),
+                 from.c_str());
     }).detach();
+}
+
+// --- The ping counter --------------------------------------------------------
+
+namespace {
+
+// Every ping::kIntervalMs, while the ping counter is on: a ping to each other
+// player in the game's Matching2 room, at the address the game sends to, and
+// the table follows who that is. Sends under g_net_mu, which a port's close
+// takes before it closes the socket.
+void pinger_main() {
+    unsigned diag_tick = 0;
+    for (;;) {
+        if (++diag_tick % 3 == 0) diag_traffic_report();  // every 15 s
+        const bool on = host_settings_ref().ping_counter;
+        if (!on) {
+            // Off (or turned off): forget everyone without a word, and wait.
+            g_game_acks_on.store(false, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(g_ping.mu);
+                g_ping.peers.clear();
+                g_ping.game_acks.clear();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(ping::kIntervalMs));
+            continue;
+        }
+        // The players in this world: the Matching2 room's other members
+        // (peer table entries below 0xff00; we are not among them), only
+        // while the game is in a room. Not every signaling connection: the
+        // game also connects to players nearby for their ghosts and signs,
+        // who never join the room.
+        std::map<std::string, std::pair<std::uint32_t, std::uint16_t>> want;  // online id -> addr, port (both nbo)
+        if (hle_np_in_room()) {
+            const std::string self = net::online_id();
+            for (const net::Peer& p : net::peers_all()) {
+                if (p.member_id >= 0xff00 || !p.addr || !p.port || p.online_id.empty() || p.online_id == self) continue;
+                want.emplace(p.online_id, std::make_pair(p.addr, bswap16(p.port)));
+            }
+        }
+        struct Send {
+            sockaddr_in to;
+            std::uint8_t pkt[ping::kLen];
+        };
+        std::vector<Send> sends;
+        {
+            std::lock_guard<std::mutex> lk(g_ping.mu);
+            const std::int64_t now = steady_ns();
+            for (auto it = g_ping.peers.begin(); it != g_ping.peers.end();) {
+                if (want.count(it->first)) {
+                    ++it;
+                    continue;
+                }
+                host_log("net: ping %s: no longer connected (%u of %u pings answered)", it->first.c_str(), it->second.answered,
+                         it->second.sent);
+                it = g_ping.peers.erase(it);
+            }
+            for (const auto& [id, at] : want) {
+                PingPeer& p = g_ping.peers[id];
+                if (p.addr != at.first || p.port != at.second) {
+                    // New, or the game now reaches it elsewhere: its pings
+                    // start over there.
+                    p = PingPeer{};
+                    p.addr = at.first;
+                    p.port = at.second;
+                    p.first_ping_ns = now;
+                    p.reported_ns = now;
+                }
+                // Silence: never answered after three, or no answer for the
+                // stale time after answering. Once until the next answer.
+                if (!p.silence_logged) {
+                    if (p.answered == 0 && p.sent >= ping::kTries) {
+                        host_log("net: ping %s: no answer to %u pings (a client without the ping counter, or nothing "
+                                 "gets through); no more pings, the game's acknowledgements give its round trip",
+                                 id.c_str(), p.sent);
+                        p.silence_logged = true;
+                    } else if (p.answered && now - p.last_pong_ns > ping::kStaleNs) {
+                        host_log("net: ping %s: no answer for %lld s", id.c_str(),
+                                 static_cast<long long>((now - p.last_pong_ns) / 1'000'000'000));
+                        p.silence_logged = true;
+                    }
+                }
+                // Best effort: a peer that never answered is not pinged again
+                // (until the game reaches it at another address). Other
+                // clients drop a ping unseen, but they get no more than a
+                // few, fewer than one hole-punch sends.
+                if (!ping::keep_pinging(p.sent, p.answered)) continue;
+                ++p.seq;
+                ++p.sent;
+                Send s{};
+                s.to.sin_family = AF_INET;
+                s.to.sin_addr.s_addr = p.addr;
+                s.to.sin_port = p.port;
+                ping::build(s.pkt, ping::kPing, p.seq, static_cast<std::uint64_t>(now));
+                sends.push_back(s);
+            }
+            // The game's own round trip: drop what is too old, then each
+            // peer's lowest sample over the window, both vports together.
+            for (auto it = g_ping.game_acks.begin(); it != g_ping.game_acks.end();) {
+                it->second.expire(now);
+                it = now - it->second.touched_ns() > 60'000'000'000 ? g_ping.game_acks.erase(it) : std::next(it);
+            }
+            for (auto& [id, p] : g_ping.peers) {
+                const std::uint64_t key = source_key(p.addr, p.port);
+                int lowest = -1;
+                std::uint32_t n = 0;
+                for (const auto& [ck, ch] : g_ping.game_acks) {
+                    if (ck.first != key) continue;
+                    const int ms = ch.lowest_ms();
+                    if (ms >= 0 && (lowest < 0 || ms < lowest)) lowest = ms;
+                    n += ch.samples_after(now - ping::kIntervalMs * 1'000'000ll);  // new since the last pass
+                }
+                p.game_ms = lowest;
+                p.game_samples += n;
+                if (lowest >= 0) p.game_min_ms = p.game_min_ms < 0 ? lowest : std::min(p.game_min_ms, lowest);
+                if (lowest >= 0 && !p.game_logged) {
+                    p.game_logged = true;
+                    host_log("net: ping %s: ~%d ms from the game's own acknowledgements", id.c_str(), lowest);
+                }
+            }
+            bool acks = false;
+            for (const auto& [id, p] : g_ping.peers) {
+                if (!p.answered || now - p.last_pong_ns > ping::kStaleNs) acks = true;
+            }
+            g_game_acks_on.store(acks, std::memory_order_relaxed);
+            // Once a minute after a peer is first seen, what its pings and the
+            // game's own acknowledgements came to over that minute: only the
+            // parts with figures, and nothing when neither has any.
+            for (auto& [id, p] : g_ping.peers) {
+                if (now - p.reported_ns < 60'000'000'000) continue;
+                p.reported_ns = now;
+                const std::uint32_t sent = p.sent - p.sent_reported, answered = p.answered - p.answered_reported;
+                const std::uint32_t samples = p.game_samples - p.game_samples_reported;
+                char pings[160] = "", acks[160] = "";
+                if (answered > 0) {
+                    std::snprintf(pings, sizeof(pings),
+                                  "last %d ms, avg %.0f, min %d, max %d; %u of %u answered this minute", p.last_ms,
+                                  p.avg_ms, p.min_ms, p.max_ms, answered, sent);
+                } else if (sent > 0) {
+                    std::snprintf(pings, sizeof(pings), "0 of %u answered this minute", sent);
+                }
+                if (p.game_min_ms >= 0) {
+                    if (p.game_ms >= 0) {
+                        std::snprintf(acks, sizeof(acks), "the game's acknowledgements: ~%d ms now, lowest %d, %u samples",
+                                      p.game_ms, p.game_min_ms, samples);
+                    } else {
+                        std::snprintf(acks, sizeof(acks), "the game's acknowledgements: lowest %d, %u samples", p.game_min_ms,
+                                      samples);
+                    }
+                }
+                if (pings[0] || acks[0]) {
+                    host_log("net: ping %s: %s%s%s", id.c_str(), pings, pings[0] && acks[0] ? "; " : "", acks);
+                }
+                p.sent_reported = p.sent;
+                p.answered_reported = p.answered;
+                p.game_samples_reported = p.game_samples;
+                p.game_min_ms = -1;
+            }
+        }
+        if (!sends.empty()) {
+            std::lock_guard<std::mutex> lock(g_net_mu);
+            auto it = g_p2p_ports.find(static_cast<std::uint16_t>(net::p2p_port()));
+            if (it != g_p2p_ports.end() && sock_ok(it->second->fd) && !it->second->stop.load(std::memory_order_relaxed)) {
+                for (const Send& s : sends) (void)p2p_sendto(it->second->fd, s.pkt, sizeof(s.pkt), true, s.to);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(ping::kIntervalMs));
+    }
+}
+
+}  // namespace
+
+void hle_net_p2p_pinger_start() {
+    if (g_pinger_started.exchange(true)) return;
+    std::thread(pinger_main).detach();
+}
+
+std::vector<P2pPing> hle_net_p2p_pings() {
+    std::vector<P2pPing> v;
+    std::lock_guard<std::mutex> lk(g_ping.mu);
+    const std::int64_t now = steady_ns();
+    for (const auto& [id, p] : g_ping.peers) {
+        P2pPing e;
+        e.online_id = id;
+        e.last_ms = p.last_ms;
+        e.avg_ms = p.avg_ms < 0 ? -1 : static_cast<int>(std::lround(p.avg_ms));
+        e.lost = p.answered ? now - p.last_pong_ns > ping::kStaleNs : p.sent >= ping::kTries;
+        e.game_ms = p.game_ms;
+        v.push_back(std::move(e));
+    }
+    return v;
 }
