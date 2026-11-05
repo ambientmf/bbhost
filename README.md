@@ -65,7 +65,7 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 - **A setup window** that finds and checks your game files, and the Steam Deck
   as a supported device.
 
-![The setup window](docs/images/setup-window.jpg)
+![The setup window](docs/images/setup-window.png)
 
 ## Status
 
@@ -113,13 +113,19 @@ See [docs/rendering.md](docs/rendering.md) for the graphics in detail and
 
 ## Getting started
 
-1. Get the game files: a dump of Bloodborne with the 1.09 update copied over
-   it (or kept beside it as `CUSA00900-UPDATE`, the way shadPS4 keeps it), and
-   the 1.09 `eboot.bin` decrypted to an ELF (SHA-256
+1. Get the game files from your own console: a dump of Bloodborne with the
+   1.09 update's files copied over it (or kept beside it as
+   `CUSA00900-UPDATE`, the way shadPS4 keeps it), and the 1.09 `eboot.bin`
+   decrypted to an ELF (SHA-256
    `941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7`).
+   [docs/running.md](docs/running.md#getting-the-game-files) walks through
+   it with ItemzFlow and says what to do when the hash differs.
 2. Download a release for Windows or Linux, or build bbhost yourself.
 3. Start `bbhost`. The setup window asks for the two paths, checks them and
-   saves them; press Play.
+   saves them. A green tick beside each path means it passed.
+4. If the setup window recommends compiling shaders (the Shaders tab and a
+   banner on the Game page do, on a first install), press **Compile now**
+   and wait: about a minute on a recent PC. Then press Play.
 
 [docs/running.md](docs/running.md) covers the configuration, the controls,
 saves, logs and troubleshooting.

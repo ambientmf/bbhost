@@ -22,6 +22,39 @@ bbhost contains no game data. You bring:
 
 Both must come from a copy of the game you own.
 
+### Getting the game files
+
+Dump both from your own console with ItemzFlow (or another dumper that writes
+decrypted files):
+
+1. Dump the game, then dump the 1.09 update. The update's folder holds
+   `sce_sys/param.sfo` with `APP_VER 01.09` and the 1.09 `eboot.bin`.
+2. Put them in one library folder as `CUSA00900` and `CUSA00900-UPDATE`, or
+   copy the update's files over the game's.
+3. In the setup window, set **Game folder** to the folder that contains
+   `dvdroot_ps4` and **Eboot** to the update's `eboot.bin`. Each row gets a
+   green tick when it passes.
+
+![The setup window's Game page](images/setup-window.png)
+
+#### The eboot's hash differs
+
+bbhost compares the eboot's SHA-256 with the retail 1.09 build's and stops at
+start when they differ, printing the hash it found, the version the dump's
+`sce_sys/param.sfo` reports and what to change. A decrypted eboot that is not
+the retail 1.09 file (an eboot from a repackaged or modified package, from
+another version, or one that a tool edited) has another hash, and every patch
+and hook in bbhost is an address in the retail build, so it cannot run.
+
+- The message names a 1.00 game with no update: dump the update and point
+  **Eboot** at its `eboot.bin`.
+- The message says the game is 1.09 and the eboot is the file that is off:
+  dump the eboot again from a retail install of the 1.09 update on your own
+  console, and point **Eboot** at that file.
+
+`BBHOST_ANY_EBOOT=1` starts any eboot without bbhost's patches; a different
+build is expected to crash.
+
 And a PC with:
 
 - x86-64 Windows 10/11 or Linux
@@ -58,6 +91,25 @@ is likely to take; it is never forced. The same tab has the Shaders setting
 (HLSL, or Lifted for the translator's own shaders only; also F10 under
 Graphics, and HLSL Shaders in the game's System > PC Graphics).
 `bbhost --compile-shaders` does the same from a terminal.
+
+![The Game page recommending a shader compile](images/setup-window.png)
+
+A new install has no shader caches, and the Game page says so with a
+**Compile now** button. The Shaders tab shows the progress, the time left
+and failures; Play waits until it ends.
+
+![Compiling shaders](images/setup-shaders-compiling.png)
+
+When it ends the tab reads Ready, and the next start takes the shaders from
+the caches.
+
+![Shader caches ready](images/setup-shaders-ready.png)
+
+The Shaders setting on that tab can stay on **HLSL**, the default: DXC's
+optimized shaders, compiled on your PC. **Lifted** uses the translator's own
+shaders only, with no DXC compiling behind the game; it is for ruling DXC out
+while troubleshooting, or for a CPU with few threads. It applies at the next
+start.
 
 Without a display (a headless run) bbhost writes a template config instead and
 tells you which paths to fill in.
