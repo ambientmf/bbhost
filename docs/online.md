@@ -111,6 +111,70 @@ seconds.
   vanilla players. A player can still be summoned into a randomizer host's
   world and play by the host's rules (see [plugins.md](plugins.md)).
 
+## Ping counter
+
+The Ping counter (F10, Display) lists the other players in your world -
+co-operators and invaders, not the players nearby whose ghosts and signs the
+game also connects to - in the top right corner, under the FPS counter, with
+the round trip of a ping to each, refreshed every 5 seconds: green below 100 ms,
+yellow to 199, red from 200. While it is on, bbhost sends the pings itself,
+once the other player's first packets have arrived, over the P2P port, as
+hole-punch probes with a ping or pong kind, to the address the game sends to
+(through the relay when the game's traffic goes that way).
+Through the server's relay, the round trip runs from you to the server, on to
+the other player and back the same way: the path the game's own traffic
+takes, longer than a direct connection between the two of you.
+The other player's bbhost answers from its port without the game seeing
+either. A client without the counter - an older bbhost, LanternEngine or
+bloodborne_pc - drops them as probes, and after three unanswered pings bbhost
+stops pinging that player. For such a player the counter reads the round trip
+from the game's own traffic instead, shown as `~250 ms`: the game's reliable
+messages carry a sequence number and acknowledge the other side's, and the
+time from one of ours to its acknowledgement, at its lowest over 10 seconds,
+is the round trip - rough, since the other game may hold an acknowledgement
+back for up to about 200 ms when it has nothing to send. `--` means neither
+has a figure yet; a player who answered pings and stopped for 12 seconds
+shows `timeout`. The log's `net: ping` lines give the first answer from each
+player, silences, and, once a minute from when a player joins, what their
+pings and the game's acknowledgements came to over that minute.
+
+## Network log
+
+F10 > Display > **Network log** (off by default) lists the last 10 matchmaking
+and connection events, live, in the top right corner, with the time of each:
+rooms opening, closing or going away, invites, players joining and leaving,
+connection attempts, and how each ended. Green is a step that worked, yellow
+needs a look, red failed.
+
+The events follow one attempt to play together. A hunter's mark that turns
+grey shows up as a room left with `0 joined`, and the lines before it say how
+far the match got:
+
+- Only `Room ... open`: nobody was matched to you.
+- `Connecting to X`, then `X: no reply on port ...`: the two games never reached
+  each other. `heard them on port ...` names the port their router really uses,
+  when it differs from the server's; `nothing ever received` means they never
+  sent.
+- `Reached X`, then `X: no handshake answer in 30 s`: the games reached each
+  other's port, and the connection's handshake never completed; the game
+  gives up on that player.
+- `Reached X`, then no `X joined the room`: the games reached each other, and
+  X's join of the server's room never completed.
+
+Connection lines follow the players of a match: members of the room, the host
+of an invite, and the player the game connects to first as it opens a room.
+The game's connections to nearby players, for ghosts and signs, are in the log
+file's `np:` and `net: punch` lines.
+
+`Connected to X` is the connection's handshake completing, and `X closed the
+connection` the other game ending it. `No data from X` appears when a player
+in the room goes quiet for 10 seconds, and `Data from X again` when they come
+back. Lines name players by online id and carry ports only, so the display is
+safe to stream or record.
+
+The log file records the same events whether or not the option is on, for
+every connection, in its `np:`, `net: punch` and `stun:` lines.
+
 ## Running a server
 
 The server is a separate project. Point `online.host` (and, if the account

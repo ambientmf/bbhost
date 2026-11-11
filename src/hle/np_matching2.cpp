@@ -16,8 +16,10 @@
 #include "hle/common.h"
 #include "host/plugins.h"
 #include "log.h"
+#include "net/event_log.h"
 #include "net/http.h"
 #include "net/account.h"
+#include "hle/net_p2p.h"
 #include "net/session.h"
 
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))
@@ -27,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace {
@@ -210,6 +213,11 @@ struct M2 {
     // on the poller before the answer is in.
     std::uint64_t joining_room = 0;
     std::int64_t room_since_ms = 0;
+    int room_joins = 0;  // players who joined this room since it was opened or joined
+    // Who the network log follows (hle_np_match_peer). Outlives the room: a
+    // connection attempt can end after the game has given up on it.
+    std::set<std::string> match_peers;
+    bool match_peer_open = false;  // a room just opened, its first connection still to come
     // LeaveRoom, deferred until the session ends
     bool leave_pending = false;
     unsigned leave_req = 0;
@@ -240,6 +248,26 @@ bool g_trace = [] {
 bool hle_np_context_started() {
     std::lock_guard<std::mutex> lk(g.mu);
     return g.started;
+}
+
+bool hle_np_in_room() {
+    std::lock_guard<std::mutex> lk(g.mu);
+    return g.in_room;
+}
+
+bool hle_np_match_peer(const std::string& online_id) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    return g.match_peers.count(online_id) != 0;
+}
+
+bool hle_np_match_peer_connecting(const std::string& online_id) {
+    constexpr std::int64_t kFirstConnectionMs = 5000;
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (g.match_peer_open && g.in_room && g.is_host && net::now_ms() - g.room_since_ms < kFirstConnectionMs) {
+        g.match_peers.insert(online_id);
+    }
+    g.match_peer_open = false;
+    return g.match_peers.count(online_id) != 0;
 }
 
 std::string hle_np_online_status() {
@@ -437,6 +465,55 @@ void forget_room_locked() {
     // (shadPS4's StopMatching2 leaves a transport with one up).
 }
 
+// For the log and the network log: every 5 s while in this room, a member
+// nothing has arrived from for kSilenceMs (from when it was first seen here,
+// for one never heard), and when it is heard again. Reads the P2P port's
+// table only.
+void watch_room_silence(std::uint64_t room) {
+    struct Seen {
+        std::int64_t first_ms = 0;
+        bool silent = false;
+    };
+    static constexpr long long kSilenceMs = 10'000;
+    static std::map<std::string, Seen> seen;  // dispatcher thread only
+    static std::uint64_t seen_room = 0;
+    net::dispatch_after(5000, net::Prio::Context, [room] {
+        std::vector<net::Peer> peers;
+        {
+            std::lock_guard<std::mutex> lk(g.mu);
+            if (!g.in_room || g.room_id != room) return;
+            peers = room_peers();
+        }
+        if (seen_room != room) {
+            seen.clear();
+            seen_room = room;
+        }
+        const std::int64_t now = net::now_ms();
+        std::map<std::string, Seen> kept;
+        for (const net::Peer& p : peers) {
+            if (p.online_id.empty() || !p.addr || !p.port) continue;
+            auto it = seen.find(p.online_id);
+            Seen s = it != seen.end() ? it->second : Seen{now, false};
+            const long long ago = hle_net_p2p_heard_ago_ms(p.addr, p.port);
+            const long long quiet = ago >= 0 ? ago : now - s.first_ms;
+            if (quiet >= kSilenceMs && !s.silent) {
+                s.silent = true;
+                host_log("np: room %llu: no data from %s for %lld s", static_cast<unsigned long long>(room),
+                         p.online_id.c_str(), quiet / 1000);
+                net::eventlog::note(net::eventlog::Level::Warn, "No data from %s for %lld s", p.online_id.c_str(),
+                                    quiet / 1000);
+            } else if (quiet < kSilenceMs && s.silent) {
+                s.silent = false;
+                host_log("np: room %llu: data from %s again", static_cast<unsigned long long>(room), p.online_id.c_str());
+                net::eventlog::note(net::eventlog::Level::Good, "Data from %s again", p.online_id.c_str());
+            }
+            kept[p.online_id] = s;
+        }
+        seen = std::move(kept);
+        watch_room_silence(room);
+    });
+}
+
 // Our LeaveRoom (or the context going away): out of the server's room,
 // DEAD for every member, then 0x103 at +300 ms. The leave goes to the server
 // from the dispatcher, ahead of the DEADs and 0x103 queued after it: until
@@ -446,6 +523,17 @@ void end_session_locked(const char* why) {
     if (!g.in_room && !g.leave_pending) return;
     g_restore_world = true;
     host_log("np: session over (%s): room %llu", why, static_cast<unsigned long long>(g.room_id));
+    if (g.room_id) {
+        const long long secs = (net::now_ms() - g.room_since_ms) / 1000;
+        if (g.is_host) {
+            net::eventlog::note(g.room_joins ? net::eventlog::Level::Info : net::eventlog::Level::Warn,
+                                "Left room %llu after %lld s: %d joined", static_cast<unsigned long long>(g.room_id), secs,
+                                g.room_joins);
+        } else {
+            net::eventlog::note(net::eventlog::Level::Info, "Left room %llu after %lld s",
+                                static_cast<unsigned long long>(g.room_id), secs);
+        }
+    }
     if (!g.session_id.empty()) {
         const std::string sid = g.session_id;
         const int mid = g.member_id;
@@ -491,6 +579,7 @@ void room_gone_locked(std::uint16_t event, std::uint8_t cause, const std::uint8_
     if (!g.in_room) return;
     const std::uint64_t room = g.room_id;
     host_log("np: room %llu gone (%s): the game hears 0x%x", static_cast<unsigned long long>(room), why.c_str(), event);
+    net::eventlog::note(net::eventlog::Level::Bad, "Room %llu gone: %s", static_cast<unsigned long long>(room), why.c_str());
     g_restore_world = true;
     std::vector<std::uint16_t> ids;
     for (const net::Peer& p : room_peers()) {
@@ -592,6 +681,9 @@ void on_server_event(const json::Value& ev) {
         net::Peer host;
         host.member_id = 1;
         host.online_id = net::str_of(ev, "HostOnlineId");
+        if (!g.in_room) g.match_peers.clear();  // in a room, its members stay followed
+        g.match_peers.insert(host.online_id);
+        g.match_peer_open = false;
         // The host's addresses as the server knows them: the peer table
         // takes them now so JoinRoom's answer only confirms, and the punch
         // opens our NAT toward the host before its first datagram. A server
@@ -632,6 +724,8 @@ void on_server_event(const json::Value& ev) {
         inv.host_online_id = host.online_id;
         host_log("np: guest_invite: room %llu from %s (%s:%lld)", static_cast<unsigned long long>(room),
                  host.online_id.c_str(), net::str_of(ev, "HostAddr").c_str(), net::int_of(ev, "HostPort", 0));
+        net::eventlog::note(net::eventlog::Level::Info, "Invited to %s's room %llu (port %lld)", host.online_id.c_str(),
+                            static_cast<unsigned long long>(room), net::int_of(ev, "HostPort", 0));
         // Hand the game its type-1 item from the dispatcher thread (guest code).
         net::dispatch_after(0, net::Prio::RoomEvent, [inv] { summon_invite_deliver(inv); });
         return;
@@ -660,6 +754,10 @@ void on_server_event(const json::Value& ev) {
         }
         host_log("np: member %u (%s) joined room %llu", p.member_id, p.online_id.c_str(),
                  static_cast<unsigned long long>(g.room_id));
+        ++g.room_joins;
+        g.match_peers.insert(p.online_id);
+        g.match_peer_open = false;
+        net::eventlog::note(net::eventlog::Level::Good, "%s joined the room", p.online_id.c_str());
         net::dispatch_after(300, net::Prio::RoomEvent, [p] {
             M2Call c;
             {
@@ -683,6 +781,8 @@ void on_server_event(const json::Value& ev) {
                                    : (reason == "leave_room" || reason.empty()) ? kCauseLeave
                                                                                 : kCauseMemberDisappeared;
         host_log("np: member %u (%s) left (%s)", mid, p.online_id.c_str(), reason.c_str());
+        net::eventlog::note(reason == "leave_room" || reason.empty() ? net::eventlog::Level::Info : net::eventlog::Level::Bad,
+                            "%s left (%s)", p.online_id.c_str(), reason.empty() ? "leave_room" : reason.c_str());
         // DEAD for that member, then MEMBER_LEFT; the room stays ours. The
         // host used to leave the server's room here when one or fewer peers
         // were left: with three in a room one leaving took the third out
@@ -902,6 +1002,7 @@ GUEST_ABI int m2_create_join_room(unsigned ctx, const std::uint8_t* reqp, const 
             sid = net::str_of(reply, "SessionId");
         } else {
             host_log("np: create_room failed: %s", err.empty() ? reply.string.c_str() : err.c_str());
+            net::eventlog::note(net::eventlog::Level::Bad, "Could not open a room");
             error = static_cast<int>(0x80550C0B);  // SCE_NP_MATCHING2_ERROR_CONNECTION_FAILED-ish: the game reports it
         }
         CreateJoinRoomResponse* resp = nullptr;
@@ -916,11 +1017,17 @@ GUEST_ABI int m2_create_join_room(unsigned ctx, const std::uint8_t* reqp, const 
                 g.is_host = true;
                 g.in_room = true;
                 g.room_since_ms = net::now_ms();
+                g.room_joins = 0;
+                g.match_peers.clear();
+                g.match_peer_open = true;
                 net::peers_clear();
                 net::room_set(sid, g.member_id);
                 resp = build_room_response(room, g.member_id, g.member_id, max_slot);
                 host_log("np: room %llu created, we are member %u", static_cast<unsigned long long>(room),
                          g.member_id);
+                net::eventlog::note(net::eventlog::Level::Info, "Room %llu open",
+                                    static_cast<unsigned long long>(room));
+                watch_room_silence(room);
             }
         }
         net::dispatch_after(300, net::Prio::Request, [req, o, error, resp] {
@@ -944,6 +1051,7 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
     if (reqp) std::memcpy(&room, reqp, 8);
     const RequestOptParam o = opt_or_default(opt);
     host_log("sceNpMatching2JoinRoom req %u room %llu", req, static_cast<unsigned long long>(room));
+    net::eventlog::note(net::eventlog::Level::Info, "Joining room %llu", static_cast<unsigned long long>(room));
     g.joining_room = room;
     net::dispatch_after(0, net::Prio::Request, [req, o, room] {
         json::Value reply;
@@ -951,6 +1059,7 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
         int error = 0;
         if (!(net::server_join_room(room, reply, err) && net::int_of(reply, "ResKind", -1) == 0)) {
             host_log("np: join_room failed: %s", err.c_str());
+            net::eventlog::note(net::eventlog::Level::Bad, "Could not join room %llu", static_cast<unsigned long long>(room));
             error = static_cast<int>(0x80550C0B);
         }
         CreateJoinRoomResponse* resp = nullptr;
@@ -970,6 +1079,7 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
                 g.is_host = false;
                 g.in_room = true;
                 g.room_since_ms = net::now_ms();
+                g.room_joins = 0;
                 // The member list is the room: entries from an invite or an
                 // earlier room go (provisional ones stay for their connections).
                 for (const net::Peer& p : net::peers_all()) {
@@ -982,6 +1092,11 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
                 resp = build_room_response(room, g.member_id, g.owner_id, g.max_slot);
                 host_log("np: joined room %llu as member %u with %zu peers", static_cast<unsigned long long>(room),
                          g.member_id, room_peers().size());
+                g.match_peers.clear();  // this room's members, an invite's host among them
+                for (const net::Peer& p : room_peers()) g.match_peers.insert(p.online_id);
+                net::eventlog::note(net::eventlog::Level::Good, "Joined room %llu, %zu other players",
+                                    static_cast<unsigned long long>(room), room_peers().size());
+                watch_room_silence(room);
             }
         }
         // The host's rules, when the server says them (HostRuleset) and they

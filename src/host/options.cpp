@@ -21,6 +21,7 @@
 #include "hle/np.h"
 #include "net/account.h"
 #include "net/nat_job.h"
+#include "net/event_log.h"
 #include "log.h"
 
 #include <algorithm>
@@ -107,6 +108,8 @@ enum SettingId {
     kFpsCounter,
     kMemoryCounter,
     kPerfOverlay,
+    kPingCounter,
+    kNetLog,
     kFov,
     kCameraDistance,
     kCameraHeight,
@@ -287,6 +290,15 @@ Setting g_set[kSettingCount] = {
     {"perf_overlay", "Performance meter", {"Off", "On"}, 0,
      "What limits the frame rate - the GPU, the main thread, the GX workers, the command processor, the frame cap - "
      "and how busy each part is, under the FPS counter (docs/performance.md).", false},
+    // Each other player in this world (co-operators, invaders) and the round
+    // trip of a ping to them, every 5 s (hle/net_p2p.h, hle_net_p2p_pings).
+    {"ping_counter", "Ping counter", {"Off", "On"}, 0,
+     "Each co-operator's and invader's ping (round trip in ms), in the top right corner, refreshed every 5 seconds. "
+     "A player whose bbhost does not answer pings shows ~ and the round trip read from the game's own traffic.", false},
+    // The last matchmaking and connection events (net/event_log.h).
+    {"net_log", "Network log", {"Off", "On"}, 0,
+     "The last matchmaking and connection events, live, in the top right corner: rooms opening and closing, invites, "
+     "players joining and leaving, connection attempts and how they ended (docs/online.md).", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY
     // (43 degrees in most areas) widened 5% a step (engine/camera.h).
     {"fov", "Field of view", signed_steps(0, 100, "%"), 0,
@@ -704,6 +716,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
+    {Row::Option, nullptr, kPingCounter},
+    {Row::Option, nullptr, kNetLog},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -1485,6 +1499,8 @@ void rebuild_settings() {
     h.fps_counter = on_of(kFpsCounter);
     h.memory_counter = on_of(kMemoryCounter);
     h.perf_overlay = on_of(kPerfOverlay);
+    h.ping_counter = on_of(kPingCounter);
+    h.net_log = on_of(kNetLog);
     {
         // BBHOST_RES=WxH still wins, so an A/B run started with one behaves
         // the way its command line says.

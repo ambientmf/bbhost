@@ -876,6 +876,15 @@ if(UNIX)
   add_executable(stun_test tests/stun_test.cpp src/net/stun.cpp)
   target_include_directories(stun_test PRIVATE src)
   add_test(NAME stun_test COMMAND stun_test)
+  # The ping counter's datagrams and arithmetic (net/ping_wire.h).
+  add_executable(ping_test tests/ping_test.cpp)
+  target_include_directories(ping_test PRIVATE src)
+  add_test(NAME ping_test COMMAND ping_test)
+  # The network log's ring (net/event_log.h).
+  add_executable(event_log_test tests/event_log_test.cpp)
+  target_include_directories(event_log_test PRIVATE src)
+  target_link_libraries(event_log_test PRIVATE pthread)
+  add_test(NAME event_log_test COMMAND event_log_test)
   # The event poller's long polls and generations (net/poll_pacing.h).
   add_executable(poll_pacing_test tests/poll_pacing_test.cpp)
   target_include_directories(poll_pacing_test PRIVATE src)

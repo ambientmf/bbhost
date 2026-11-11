@@ -7,6 +7,7 @@
 #include "hle/hle.h"
 #include "log.h"
 #include "net/account.h"
+#include "net/event_log.h"
 #include "net/http.h"
 #include "net/poll_pacing.h"
 
@@ -14,6 +15,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #endif
 #include <atomic>
 #include <chrono>
@@ -28,6 +30,16 @@
 namespace net {
 
 namespace {
+
+// BBHOST_NET_TRACE=1 (hle/net.cpp's every-datagram trace): the server's
+// answers in full too.
+bool net_trace() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_NET_TRACE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
 
 using clock = std::chrono::steady_clock;
 
@@ -226,6 +238,8 @@ void poller_main(std::uint64_t gen) {
             if (failed) {
                 host_log("np: events: the server answers again (%d polls failed in %lld s)", failed,
                          static_cast<long long>((now_ms() - failed_since) / 1000));
+                eventlog::note(eventlog::Level::Good, "The server answers again, after %lld s",
+                               static_cast<long long>((now_ms() - failed_since) / 1000));
                 failed = 0;
             }
             const int holds = n.state.wait_ms > 0 ? 1 : 0;
@@ -241,6 +255,7 @@ void poller_main(std::uint64_t gen) {
             }
         } else if (!o.refused && failed++ == 0) {
             failed_since = now_ms();
+            eventlog::note(eventlog::Level::Bad, "The server stopped answering");
             host_log("np: events: no answer (%s); asking again in %.1f s, then backing off up to %d s",
                      status ? ("HTTP " + std::to_string(status)).c_str() : err.c_str(), n.sleep_ms / 1000.0,
                      poll_pacing::kBackoffMaxMs / 1000);
@@ -291,6 +306,23 @@ void stun_server(std::string* host, std::uint16_t* port) {
 
 bool mapped_fresh_locked() { return g_mapped.asked && now_ms() - g_mapped.at_ms < 120000; }
 
+// The STUN server's IPv4 address (network order), 0 when the name does not
+// resolve. An answer that names this address is a relay port on the server.
+std::uint32_t stun_server_ipv4(const std::string& host) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* res = nullptr;
+    std::uint32_t a = 0;
+    if (!host.empty() && ::getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
+        sockaddr_in sa{};
+        std::memcpy(&sa, res->ai_addr, sizeof(sa));
+        a = sa.sin_addr.s_addr;
+        ::freeaddrinfo(res);
+    }
+    return a;
+}
+
 // Until 2026-10-25 this held g_mapped.mu through the exchange - three 1 s
 // attempts and a name lookup when the server does not answer - so the
 // dispatcher's create and join (our_endpoint) waited out every keepalive
@@ -330,18 +362,49 @@ void mapped_refresh(bool force) {
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
         }
     }
+    // The server's own address, for telling a relay port from our public one
+    // when the answer carries no BBHOST-RELAY: looked up before g_mapped.mu.
+    const std::uint32_t server_addr = (ok && !relay.present) ? stun_server_ipv4(host) : 0;
     std::lock_guard<std::mutex> lk(g_mapped.mu);
+    static bool no_answer_noted = false;  // under g_mapped.mu: one network log line an outage
     if (!ok) {
         if (!g_mapped.addr.empty()) return;  // keep the last answer
         host_log("stun: no answer from %s:%u; the server gets the LAN address only (online.p2p_addr)", host.c_str(),
                  sport);
+        if (!no_answer_noted) {
+            no_answer_noted = true;
+            eventlog::note(eventlog::Level::Bad, "STUN gave no answer: other players get your local address");
+        }
         return;
     }
+    no_answer_noted = false;
     char text[32];
     std::snprintf(text, sizeof(text), "%u.%u.%u.%u", addr & 0xff, (addr >> 8) & 0xff, (addr >> 16) & 0xff, addr >> 24);
     if (g_mapped.addr != text || g_mapped.port != port) {
-        host_log("stun: %s:%u sees our P2P port %d as %s:%u%s", host.c_str(), sport, p2p_port(), text, port,
-                 (text == local_addr_text() && port == p2p_port()) ? " (no NAT in between)" : "");
+        // A server that relays everyone answers with its own address and the
+        // relay port it keeps for us, with BBHOST-RELAY when we asked for it
+        // (it then also names the port our router sent from) and without
+        // when we did not. Either way the port is the server's.
+        const bool relay_port = relay.present || (server_addr != 0 && addr == server_addr);
+        if (relay_port) {
+            char router[48] = "";
+            if (relay.present && relay.observed_port) {
+                std::snprintf(router, sizeof(router), "; our router sent from port %u", relay.observed_port);
+            }
+            host_log("stun: %s:%u answers with our relay port on the server, %s:%u (P2P port %d%s)", host.c_str(),
+                     sport, text, port, p2p_port(), router);
+            eventlog::note(eventlog::Level::Info, "Connected through the server's relay (port %u)", port);
+        } else {
+            host_log("stun: %s:%u sees our P2P port %d as %s:%u%s", host.c_str(), sport, p2p_port(), text, port,
+                     (text == local_addr_text() && port == p2p_port()) ? " (no NAT in between)" : "");
+            if (port == p2p_port()) {
+                eventlog::note(eventlog::Level::Info, "Other players reach you on port %u", port);
+            } else {
+                eventlog::note(eventlog::Level::Info,
+                               "Other players reach you on port %u (your router changed it from %d)", port,
+                               p2p_port());
+            }
+        }
     }
     g_mapped.addr = text;
     g_mapped.port = port;
@@ -534,6 +597,9 @@ bool server_signaling_resolve(const std::string& id, std::uint32_t* addr, std::u
     body.set("OnlineId", id);
     json::Value reply;
     if (!np_post("/np/signaling/resolve", body, reply, error)) return false;
+    // BBHOST_NET_TRACE=1: the server's whole answer, the fields this
+    // function does not read included.
+    if (net_trace()) host_log("net: resolve %s -> %s", id.c_str(), json::dump(reply, 0).c_str());
     if (int_of(reply, "ResKind", -1) != 0) {
         error = "not registered";
         return false;
@@ -678,6 +744,31 @@ void server_signaling_update() {
     np_post("/mp/matching2/signaling_update", body, reply, err, 4000);
 }
 
+// What the server tells other players about us - our own online id
+// resolved, as a peer's sceNpSignalingActivateConnection would - against our
+// STUN address. A peer probes the address the server gives it, so when the
+// two differ nobody can reach us; logged only then. Checked when the
+// keepalive starts and after each address change it sends.
+void self_resolve_check() {
+    std::string mapped;
+    {
+        std::lock_guard<std::mutex> lk(g_mapped.mu);
+        if (g_mapped.addr.empty() || !g_mapped.port) return;
+        mapped = g_mapped.addr + ":" + std::to_string(g_mapped.port);
+    }
+    json::Value body = json::Value::make_object();
+    body.set("OnlineId", online_id());
+    json::Value reply;
+    std::string err;
+    if (!np_post("/np/signaling/resolve", body, reply, err, 4000) || int_of(reply, "ResKind", -1) != 0) return;
+    const std::string told = str_of(reply, "Addr") + ":" + std::to_string(int_of(reply, "Port", 0));
+    if (told != mapped) {
+        host_log("net: the server tells other players we are at %s, but our STUN address is %s: their connections to "
+                 "us go to the wrong place",
+                 told.c_str(), mapped.c_str());
+    }
+}
+
 // While the context runs: the STUN binding every 15 s. It keeps our NAT
 // mapping to the server open (a router forgets an idle UDP mapping in 30 s
 // to a few minutes, and then nothing the relay sends gets in) and the
@@ -692,6 +783,7 @@ void keepalive_main(std::uint64_t gen) {
         std::lock_guard<std::mutex> lk(g_mapped.mu);
         last = g_mapped.addr + ":" + std::to_string(g_mapped.port);
     }
+    self_resolve_check();
     for (;;) {
         if (!g_gate.sleep(gen, 15000)) break;
         mapped_refresh(true);
@@ -701,8 +793,10 @@ void keepalive_main(std::uint64_t gen) {
             now = g_mapped.addr + ":" + std::to_string(g_mapped.port);
         }
         if (now != last && now != ":0") {
-            host_log("stun: our address is now %s (was %s); telling the server", now.c_str(), last.c_str());
+            host_log("stun: the address other players get for us is now %s (was %s); telling the server", now.c_str(),
+                     last.c_str());
             server_signaling_update();
+            self_resolve_check();
             last = now;
         }
     }

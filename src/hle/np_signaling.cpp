@@ -42,6 +42,7 @@
 #include "hle/common.h"
 #include "hle/net_p2p.h"
 #include "log.h"
+#include "net/event_log.h"
 #include "net/session.h"
 
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))
@@ -328,6 +329,14 @@ void start_stepping_locked(unsigned tid) {
     net::dispatch_after(kStepMs, net::Prio::Signaling, [tid] { step(tid); });
 }
 
+// A network log line about `peer` when the player is part of a match. From
+// the dispatcher: callers hold g_mu, and the room's lock comes before it.
+void note_match(net::eventlog::Level level, const std::string& peer, std::string text) {
+    net::dispatch_after(0, net::Prio::Signaling, [level, peer, text = std::move(text)] {
+        if (hle_np_match_peer(peer)) net::eventlog::note(level, "%s", text.c_str());
+    });
+}
+
 // Every 500 ms until Established: the current step again; DEAD after 30 s.
 void step(unsigned tid) {
     std::vector<Event> events;
@@ -345,6 +354,8 @@ void step(unsigned tid) {
                 host_log("np: transport %u to %s: handshake not done in %d s: DEAD (timeout)", tid, t.online_id.c_str(),
                          kGiveUpMs / 1000);
                 const std::string who = t.online_id;
+                note_match(net::eventlog::Level::Bad, who,
+                           who + ": no handshake answer in " + std::to_string(kGiveUpMs / 1000) + " s");
                 close_transport_dead_locked(tid, kErrTimeout, events);  // erases the transport
                 net::dispatch_after(0, net::Prio::Signaling, [who] { hle_np_matching2_transport_dead(who, kM2ErrTimeout); });
             } else {
@@ -369,6 +380,8 @@ void establish_locked(unsigned tid, bool peer_activated_hint, std::vector<Event>
         t.established_fired = true;
         send_locked(t, kEstablishedMsg);
         set_peer_status_locked(tid, 2);
+        host_log("np: transport %u to %s: established", tid, t.online_id.c_str());
+        note_match(net::eventlog::Level::Good, t.online_id, "Connected to " + t.online_id);
         const std::string who = t.online_id;
         net::dispatch_after(kM2EstablishDelayMs, net::Prio::Signaling, [who] { hle_np_matching2_transport_up(who); });
     }
@@ -451,6 +464,7 @@ void activation(unsigned conn_id) {
         std::uint16_t port = 0;
         std::string error;
         const bool ok = net::server_signaling_resolve(peer, &addr, &port, error);
+        const bool matched = hle_np_match_peer(peer);  // before g_mu: the room's lock comes first
         std::vector<Event> events;
         {
             std::lock_guard<std::mutex> lk(g_mu);
@@ -471,6 +485,7 @@ void activation(unsigned conn_id) {
                 if (c.resolve_waited_ms >= kGiveUpMs) {
                     host_log("np: conn %u to %s: no address in %d s (%s): DEAD (timeout)", conn_id, peer.c_str(),
                              kGiveUpMs / 1000, error.c_str());
+                    if (matched) net::eventlog::note(net::eventlog::Level::Bad, "%s: the server has no address for them", peer.c_str());
                     close_conn_dead_locked(conn_id, kErrTimeout, events);
                 } else {
                     net::dispatch_after(kStepMs, net::Prio::Signaling, [conn_id] { activation(conn_id); });
@@ -531,6 +546,16 @@ GUEST_ABI int sig_delete_ctx(unsigned ctx) {
     }
     return 0;
 }
+// The network log's line for a connection the game asked for, when the player
+// is part of a match. From the dispatcher: the caller holds g_mu, and the
+// room's lock comes before it.
+void note_connecting(const std::string& peer) {
+    net::dispatch_after(0, net::Prio::Signaling, [peer] {
+        if (hle_np_match_peer_connecting(peer)) {
+            net::eventlog::note(net::eventlog::Level::Info, "Connecting to %s", peer.c_str());
+        }
+    });
+}
 
 // (ctxId, const SceNpId* peer, connId*), as shadPS4's ActivateSig1: one live
 // connection per context and player; a new or re-activated one sends
@@ -575,6 +600,7 @@ GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
         if (t.state == State::Established) establish_locked(tid, false, events);
     }
     *conn_out = id;
+    note_connecting(peer);
     if (queue) net::dispatch_after(0, net::Prio::Signaling, [id] { activation(id); });
     queue_all(std::move(events));
     return 0;
@@ -733,6 +759,8 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
         }
         case kClose: {
             if (!tid) break;
+            host_log("np: %s closed the connection (%s)", from.c_str(), reason == kTerminate ? "terminate" : "deactivate");
+            note_match(net::eventlog::Level::Info, from, from + " closed the connection");
             const unsigned cid = find_conn_locked(from);
             if (reason == kDeactivate && cid && g_tr[tid].state == State::Established) {
                 events.emplace_back(g_conn[cid].ctx, cid, kEvPeerDeactivated, 0);
