@@ -15,6 +15,7 @@
 #include "guest_abi.h"
 #include "hle/net_p2p.h"
 #include "hle/np.h"
+#include "host/settings.h"
 #include "log.h"
 #include "net/session.h"
 
@@ -209,13 +210,22 @@ std::vector<std::uint8_t> relay_answer(const std::uint8_t* req, std::size_t n, s
 }  // namespace
 
 // What hle/net.cpp needs from the rest of the host: the HLE table, the
-// session layer's P2P port and dispatcher, and NpSignaling's control
-// datagrams (none come here).
+// session layer's P2P port and dispatcher, NpSignaling's control
+// datagrams (none come here), and what the ping counter and the network log
+// read (the counter is off here and the port is in no room, so it pings no one).
 void register_hle_fn(const char* name, void* f) { g_fns[name] = f; }
+const HostSettings& host_settings_ref() {
+    static const HostSettings settings;
+    return settings;
+}
+bool hle_np_in_room() { return false; }
+bool hle_np_match_peer(const std::string&) { return false; }
 namespace net {
 int p2p_port() { return g_port; }
 void set_p2p_port_bound(int port) { g_port = port; }
 void dispatch_after(int, Prio, std::function<void()>) {}
+std::string online_id() { return "test"; }
+std::vector<Peer> peers_all() { return {}; }
 }  // namespace net
 void hle_np_signaling_control(const std::uint8_t*, std::size_t, std::uint32_t, std::uint16_t) {}
 

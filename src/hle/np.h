@@ -19,6 +19,17 @@ bool hle_np_context_started();
 // on the way in counts from the server's member-joined event, before the game
 // has made anything of them (plugin API 29's world_state).
 std::uint32_t hle_np_room_others();
+// True while the game is in a Matching2 room - a world shared with summoned
+// players or invaders - as host or as guest. The peer table's members below
+// 0xff00 are then the room's other players (the ping counter's list).
+bool hle_np_in_room();
+// The network log's scope (net/event_log.h): whether this player is part of a
+// match - a member of the room, the host of an invite, or the player the game
+// connected to first as it opened a room for them.
+bool hle_np_match_peer(const std::string& online_id);
+// The same for a connection the game has just asked for: the first one in the
+// seconds after it opened a room is the player it opened the room for.
+bool hle_np_match_peer_connecting(const std::string& online_id);
 void hle_register_np_signaling();
 
 // NpSignaling learns a peer's address: fires ESTABLISHED/ACTIVE for a

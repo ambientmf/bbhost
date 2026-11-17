@@ -82,6 +82,8 @@ bool hle_net_p2p_stun(const char*, std::uint16_t, int, std::uint32_t*, std::uint
     std::abort();
 }
 void hle_net_p2p_punch(const char*, std::uint32_t, std::uint16_t, std::uint32_t, std::uint16_t) {}
+long long hle_net_p2p_heard_ago_ms(std::uint32_t, std::uint16_t) { return -1; }
+bool hle_net_p2p_relay(std::uint32_t*, std::uint16_t*) { return false; }
 void hle_net_p2p_signal(std::uint32_t addr, std::uint16_t port, const void* data, std::size_t n) {
     const auto* p = static_cast<const std::uint8_t*>(data);
     packets.push_back({addr, port, {p, p + n}});
